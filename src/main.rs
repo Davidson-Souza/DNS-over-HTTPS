@@ -10,7 +10,7 @@
 //! else, this may be a good fit for you.
 
 use clap::Parser;
-use log::debug;
+use log::{debug, error, trace};
 use reqwest::{Client, Proxy};
 use simplelog::{Config, SharedLogger};
 use std::{
@@ -60,25 +60,42 @@ async fn main() -> anyhow::Result<()> {
 
     // We only handle one client at the time
     while let Ok((count, origin)) = listener.recv_from(&mut buffer) {
-        let request = buffer[0..count].to_vec();
-
-        // Retrieve the query paramenter to log
-        let mut name = String::new();
-        get_query_names(&request[12..], &mut name);
-
-        // Remove expired entries from our cache
-        invalidate_cache(&mut cache, ttl, false);
-        cache_hit(&client, &mut cache, &args.remote, &name, request.clone()).await?;
-
-        let (_, res) = cache.get(&request[2..]).unwrap();
-        let res = request[0..2]
-            .iter()
-            .chain(res.into_iter())
-            .copied()
-            .collect::<Vec<_>>();
-        listener.send_to(res.as_slice(), origin)?;
+        match do_request(&mut cache, &client, &listener, count, origin, &buffer, ttl, &args.remote).await {
+            Ok(_) => trace!("Handled request from {origin}"),
+            Err(e) => error!("error handling request from {origin}, reason: {e}"),
+        }
     }
 
+    Ok(())
+}
+
+async fn do_request(
+    cache: &mut Cache,
+    client: &Client,
+    listener: &UdpSocket,
+    count: usize,
+    origin: SocketAddr,
+    buffer: &[u8],
+    ttl: u64,
+    remote: &str
+) -> anyhow::Result<()> {
+    let request = buffer[0..count].to_vec();
+
+    // Retrieve the query paramenter to log
+    let mut name = String::new();
+    get_query_names(&request[12..], &mut name);
+
+    // Remove expired entries from our cache
+    invalidate_cache(cache, ttl, false);
+    cache_hit(&client, cache, remote, &name, request.clone()).await?;
+
+    let (_, res) = cache.get(&request[2..]).unwrap();
+    let res = request[0..2]
+        .iter()
+        .chain(res.into_iter())
+        .copied()
+        .collect::<Vec<_>>();
+    listener.send_to(res.as_slice(), origin)?;
     Ok(())
 }
 
@@ -134,6 +151,7 @@ async fn cache_hit(
     debug!("{} MISS", name);
     cache_miss(client, cache, remote, request).await
 }
+
 fn get_query_names(req: &[u8], acc: &mut String) {
     let len = req[0] as usize;
     if len == 0 {
